@@ -6,7 +6,11 @@ interface Env {
 // Configuration - adjust as needed
 const BUFFER_TIMEOUT_MS = 10000;
 const KEEPALIVE_INTERVAL_MS = 20000;
-const MAX_BUFFER_SIZE = 10;
+// Per-connection memory ceiling for messages queued during the upstream
+// handshake. NOT a count cap (that would disconnect clients firing many
+// subscribes at connect). 1 MB holds thousands of subscribes; kept modest
+// because one isolate can host many connections sharing its heap.
+const MAX_PRECONNECT_BUFFER_BYTES = 1024 * 1024;
 
 const KEEPALIVE_MESSAGE = JSON.stringify({
 	jsonrpc: "2.0",
@@ -77,8 +81,11 @@ async function handleWebSocket(request: Request, env: Env, corsHeaders: Record<s
 		? new WebSocket(upstreamUrl, [selectedProtocol])
 		: new WebSocket(upstreamUrl);
 
-	// Message buffering for race condition fix
+	// Queued until upstream opens, then flushed. Bounded by bytes, not count.
 	let bufferedData: (string | ArrayBuffer)[] = [];
+	let bufferedBytes = 0;
+	const sizeOf = (data: string | ArrayBuffer): number =>
+		typeof data === 'string' ? data.length : data.byteLength;
 	let bufferTimeout: ReturnType<typeof setTimeout> | null = null;
 	let isUpstreamConnected = false;
 
@@ -118,6 +125,7 @@ async function handleWebSocket(request: Request, env: Env, corsHeaders: Record<s
 		bufferTimeout = setTimeout(() => {
 			if (bufferedData.length > 0 && !isUpstreamConnected) {
 				bufferedData = [];
+				bufferedBytes = 0;
 				try {
 					server.close(1011, "upstream_connection_timeout");
 				} catch { }
@@ -129,6 +137,7 @@ async function handleWebSocket(request: Request, env: Env, corsHeaders: Record<s
 		clearKeepalive();
 		clearBufferTimeout();
 		bufferedData = [];
+		bufferedBytes = 0;
 	};
 
 	// Upstream connection open
@@ -143,6 +152,7 @@ async function handleWebSocket(request: Request, env: Env, corsHeaders: Record<s
 					upstream.send(data);
 				}
 				bufferedData = [];
+				bufferedBytes = 0;
 			} catch {
 				cleanup();
 				try { server.close(1011, "upstream_ws_error"); } catch { }
@@ -162,17 +172,21 @@ async function handleWebSocket(request: Request, env: Env, corsHeaders: Record<s
 				try { server.close(1011, "upstream_ws_error"); } catch { }
 			}
 		} else {
-			// Buffer with size limit
-			if (bufferedData.length >= MAX_BUFFER_SIZE) {
-				cleanup();
-				try { server.close(1011, "buffer_overflow"); } catch { }
-				return;
-			}
-
 			if (bufferedData.length === 0) {
 				startBufferTimeout();
 			}
+			const incoming = sizeOf(event.data);
+
+			// Bound memory without disconnecting a healthy client; only a
+			// pathological flood (never a real subscribe burst) trips this.
+			if (bufferedBytes + incoming > MAX_PRECONNECT_BUFFER_BYTES) {
+				cleanup();
+				try { server.close(1011, "preconnect_buffer_bytes_exceeded"); } catch { }
+				return;
+			}
+
 			bufferedData.push(event.data);
+			bufferedBytes += incoming;
 		}
 	});
 
